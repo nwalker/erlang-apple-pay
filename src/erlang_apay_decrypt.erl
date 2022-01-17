@@ -2,19 +2,20 @@
 
 -define(LEAF_CERT_OID, {1, 2, 840, 113635, 100, 6, 29}).
 -define(INTER_CERT_OID, {1, 2, 840, 113635, 100, 6, 2, 14}).
--define(OID_SIGNING_TIME, {1, 2, 840, 113549, 1, 9, 5}).
+-define(SIGNING_TIME_OID, {1, 2, 840, 113549, 1, 9, 5}).
+-define(MESSAGE_DIGEST_OID, {1, 2, 840, 113549, 1, 9, 4}).
 
 -export([
     verify_and_decrypt_apay_message/1,
     verify_and_decrypt_apay_message/2
 ]).
 
-% Preparation
+%%% Preparation
 
 prepare_env(APayMessage) ->
     [].
 
-% Main job
+%%% Main job
 
 verify_and_decrypt_apay_message(APayMessage) ->
     verify_and_decrypt_apay_message(APayMessage, []).
@@ -35,11 +36,12 @@ verify_and_decrypt_apay_message(APayMessage, Opts) ->
         {error, _} = Err -> Err 
     end.
 
-% Verification
+%%% Verification
 verify_apay_message(APayMsg, Env) ->
     B64Signature = maps:get(<<"signature">>, APayMsg),
     Signature = base64:decode(B64Signature),
     Certs = extract_certs(Signature),
+    {Signer, SigningTime} = extract_signing_data(Signature),
     case length(Certs) of
         2 -> 
             verify_apay_certs(Certs, Env);
@@ -57,12 +59,28 @@ verify_apay_certs(Certs, Env) ->
     case CertChain of
         {ok, CertChain1} -> 
             case verify_apay_cert_chain(CertChain1, Env) of
-                {ok, _} -> ok;
+                {ok, _} ->
+                    verify_signature();
                 Err -> Err
             end;
         Err -> Err
     end.
 
+verify_signature() ->
+    case {check_signature_issuer(), cms_signing_time()} of
+        {false, _} -> {error, bad_signature_issuer};
+        {_, false} -> {error, bad_signing_time};
+        {true, true} ->
+            case check_message_digest() of
+                true -> ok;
+                false -> {error, bad_message_digest}
+            end
+    end.
+
+check_message_digest(Env) ->
+    SignDigest = proplists:get_value(sign_digest, Env),
+    MessageDigest = construct_message_digest(),
+    eq(SignDigest, MessageDigest).
 extract_leaf_and_intermediate_certificates(Certs) ->
     ExtractedCerts = {
         find_cert_by_oid(Certs, ?LEAF_CERT_OID),
@@ -103,9 +121,16 @@ check_cms_signing_time(SigningTime, CheckTime, Threshold) ->
 check_signature_issuer(Signature, LeafCert) ->
     ok.
 
-extract_singing_data(Signature) ->
+extract_signing_data(Signature) ->
+    SiSet = hd(element(1, element(7, Signature))),
+    {aaSet, AASet} = elemnt(4, SiSet),
+    SigningTime = get_by_oid(AASet, ?SIGNING_TIME_OID),
     ok.
 
+construct_message_digest() ->
+    ok.
+
+%%% Decryption
 decrypt_apay_message(APayMsg, Env) ->
     EphKey = proplists:get_value(eph_key, Env),
     WKey = public_key:der_decode('SubjectPublicKeyInfo', EphKey),
@@ -129,13 +154,13 @@ do_decrypt(Data, SymKey) ->
     crypto:crypto_one_time_aead(aes_256_gcm, SymKey, IV, Data1, <<>>, Tag, false).
 
 apay_kdf(SharedSecret, PartyV) ->
-    KDFAlgo = <<13:1, "id-aes256-GCM">>,
+    KDFAlgo = <<13:8, "id-aes256-GCM">>,
     KDFInfo = <<KDFAlgo/binary, "Apple", PartyV/binary>>,
     Counter = <<1:32/big>>,
     ToHash = <<Counter/binary, SharedSecret/binary, KDFInfo/binary>>,
     crypto:hash(sha256, ToHash).
 
-% Utils
+%%% Utils
 normalize_oid(OID) ->
     OIDParts = binary:split(OID, <<".">>),
     OIDParts1 = lists:map(fun binary_to_integer/1, OIDParts),
@@ -157,3 +182,13 @@ get_by_oid(Attrs, OID) ->
         false -> {error, {no_extention, OID}};
         {value, V} -> {ok, V}
     end.
+
+% https://github.com/mochi/mochiweb/blob/main/src/mochiweb_session.erl#L104
+eq(A, B) when is_binary(A) andalso is_binary(B) ->
+    eq(A, B, 0).
+eq(<<A, As/binary>>, <<B, Bs/binary>>, Acc) ->
+    eq(As, Bs, Acc bor (A bxor B));
+eq(<<>>, <<>>, 0) ->
+    true;
+eq(_As, _Bs, _Acc) ->
+    false.
