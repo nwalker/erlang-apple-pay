@@ -10,7 +10,7 @@ by adding `apay_decrypt_ex` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:apay_decrypt_ex, "~> 0.1.0"}
+    {:apay_decrypt_ex, "~> 0.1.0"},
   ]
 end
 ```
