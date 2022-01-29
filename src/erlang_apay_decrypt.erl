@@ -4,26 +4,54 @@
 -define(INTER_CERT_OID, {1, 2, 840, 113635, 100, 6, 2, 14}).
 -define(SIGNING_TIME_OID, {1, 2, 840, 113549, 1, 9, 5}).
 -define(MESSAGE_DIGEST_OID, {1, 2, 840, 113549, 1, 9, 4}).
+-define(MERCH_HASH_OID, {1, 2, 840, 113635, 100, 6, 32}).
 
 -export([
-    prepare_env/3,
+    prepare_env/4,
     verify_and_decrypt_apay_message/2
 ]).
 
 %%% Preparation
 
-prepare_env(RawPrivateKey, RawAppleRoot, Threshold) ->
+prepare_env(RawCert, RawPrivateKey, RawAppleRoot, Threshold) ->
     [
+        {merch_hash, extract_merch_hash(RawCert)},
         {private_key, extract_private_key(RawPrivateKey)},
         {root_cert, RawAppleRoot},
         {threshold, Threshold}
     ].
+
+extract_merch_hash(RawCert) ->
+    [PEMEntry] = public_key:pem_decode(RawCert),
+    Cert = public_key:pem_entry_decode(PEMEntry),
+    {ok, Extention} = get_extention_from_cert(Cert, ?MERCH_HASH_OID),
+    <<_Dirt:2/binary, HexyHash/binary>> = element(4, Extention),
+    unhexify(HexyHash).
 
 extract_private_key(RawPrivateKey) ->
     [Entry] = public_key:pem_decode(RawPrivateKey),
     DecodedEntry = public_key:pem_entry_decode(Entry),
     {PKey, {namedCurve, NamedCurve}} = {element(3,DecodedEntry), element(4, DecodedEntry)},
     {PKey, pubkey_cert_records:namedCurves(NamedCurve)}.
+
+divide_message(APayMessage) ->
+    Header = maps:get(<<"header">>, APayMessage),
+    EphKey = base64:decode(maps:get(<<"ephemeralPublicKey">>, Header)),
+    TransactionId = unhexify(maps:get(<<"transactionId">>, Header)),
+
+    Data = base64:decode(map_get(<<"data">>, APayMessage)),
+    AppData = 
+        case maps:get(<<"applicationData">>, Header, undefined) of
+            undefined -> <<>>;
+            AD -> unhexify(AD)
+        end,
+
+    [
+        {eph_key, EphKey},
+        {data, Data},
+        {transaction_id, TransactionId},
+        {app_data, AppData}
+    ].
 
 %%% Main job
 
@@ -55,16 +83,19 @@ verify_and_decrypt_apay_message(APayMessage, Opts) ->
                         undefined -> 0;
                         Thresh -> Thresh
                     end,
-                prepare_env(RawPrivateKey, RawAppleRoot, Threshold);
+                RawCert = proplists:get_vaue(raw_merch_cert, Opts),
+                prepare_env(RawCert, RawPrivateKey, RawAppleRoot, Threshold);
             E -> E
         end,
 
-    Env = Env0 ++ [
+    Env1 = divide_message(APayMessage),
+
+    Env = Env0 ++ Env1 ++ [
         {skip_chain_check, SkipChainCheck},
         {check_time, CheckTime}
     ],
     case verify_apay_message(APayMessage, Env) of
-        ok -> decrypt_apay_message(APayMessage, Env);
+        ok -> decrypt_apay_message(Env);
         {error, _} = Err -> Err 
     end.
 
@@ -93,7 +124,7 @@ extract_certs(Signature) ->
 verify_apay_certs(Certs, Env) ->
     CertChain = extract_leaf_and_intermediate_certificates(Certs),
     case CertChain of
-        {ok, [LeafCert, _] = CertChain1} -> 
+        {ok, [_, LeafCert] = CertChain1} -> 
             case verify_apay_cert_chain(CertChain1, Env) of
                 {ok, _} ->
                     verify_signature(LeafCert, Env);
@@ -118,7 +149,7 @@ verify_signature(LeafCert, Env) ->
     end.
 
 check_message_digest(Env) ->
-    SignDigest = proplists:get_value(sign_digest, Env),
+    SignDigest = proplists:get_value(message_digest, Env),
     MessageDigest = construct_message_digest(Env),
     eq(SignDigest, MessageDigest).
 extract_leaf_and_intermediate_certificates(Certs) ->
@@ -160,7 +191,7 @@ check_cms_signing_time(SigningTime, CheckTime, Threshold) ->
     D >= 0 andalso D < Threshold.
 
 check_signature_issuer(Signer, LeafCert) ->
-    CertSerial = element(3, LeafCert),
+    CertSerial = element(3, element(2, LeafCert)),
     Signer == CertSerial.
 
 extract_signing_data(Signature) ->
@@ -169,25 +200,43 @@ extract_signing_data(Signature) ->
     
     {_, _, Signer} = element(3, SiSet),
     
-    {_SigningTimeTag, _OID, [{utcTime, RawSigningTime}]} = get_by_oid(AASet, ?SIGNING_TIME_OID),
+    {ok, SigTime} = get_by_oid(AASet, ?SIGNING_TIME_OID),
+    {_SigningTimeTag, _OID, [{utcTime, RawSigningTime}]} = SigTime,
     {SigningTime, _} = string:to_integer(RawSigningTime),
+
+    {ok, Dig} = get_by_oid(AASet, ?MESSAGE_DIGEST_OID),
+    {_SignDigestTag, _OID1, [Digest]} = Dig,
     
     [
         {signing_time, SigningTime},
-        {signer, Signer}
+        {signer, Signer},
+        {message_digest, Digest}
     ].
 
 construct_message_digest(Env) ->
-    ok.
+    EphKey = proplists:get_value(eph_key, Env),
+    Data = proplists:get_value(data, Env),
+    TransactionId = proplists:get_value(transaction_id, Env),
+    AppData = proplists:get_value(app_data, Env),
+
+    % io:fwrite("~p ~p ~p ~p", [EphKey, Data, TransactionId, AppData]),
+
+    DigMaterial = <<
+        EphKey/binary,
+        Data/binary,
+        TransactionId/binary,
+        AppData/binary
+    >>,
+
+    crypto:hash(sha256, DigMaterial).
 
 %%% Decryption
-decrypt_apay_message(APayMsg, Env) ->
+decrypt_apay_message(Env) ->
     EphKey = proplists:get_value(eph_key, Env),
     WKey = public_key:der_decode('SubjectPublicKeyInfo', EphKey),
     
     Key = element(3, WKey),
-    PKey = proplists:get_value(private_key, Env),
-    Curve = proplists:get_value(curve, Env),
+    {PKey, Curve} = proplists:get_value(private_key, Env),
 
     SharedSecret = crypto:compute_key(ecdh, Key, PKey, Curve),
     MerchHash = proplists:get_value(merch_hash, Env),
@@ -231,6 +280,16 @@ get_by_oid(Attrs, OID) ->
         false -> {error, {no_extention, OID}};
         {value, V} -> {ok, V}
     end.
+
+unhexify(Text) ->
+    unhexify(Text, <<>>).
+unhexify(<<>>, Result) ->
+    Result;
+unhexify(<<Byte:2/binary, Rest/binary>>, Result) ->
+    BS = binary_to_list(Byte),
+    I = list_to_integer(BS, 16),
+    NewRes = <<Result/binary, I>>,
+    unhexify(Rest, NewRes).
 
 % https://github.com/mochi/mochiweb/blob/main/src/mochiweb_session.erl#L104
 eq(A, B) when is_binary(A) andalso is_binary(B) ->
