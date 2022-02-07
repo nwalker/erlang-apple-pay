@@ -1,4 +1,4 @@
-{application, erlang_apay_decrypt,
+{application, apay_tool,
  [{description, "An OTP library"},
   {vsn, "0.1.0"},
   {registered, []},
@@ -9,6 +9,6 @@
   {env,[]},
   {modules, []},
 
-  {licenses, ["Apache 2.0"]},
+  {licenses, ["MIT"]},
   {links, []}
  ]}.

@@ -1,4 +1,5 @@
 .rebar3
+deps/
 _*
 .eunit
 *.o
