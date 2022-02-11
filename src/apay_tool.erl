@@ -20,7 +20,7 @@ config(Opts) ->
     orelse erlang:error({badarg, Opts}),
   case {maps:get(skip_chain_verification, Opts, false), maps:get(certificate_root, Opts, undefined)} of
     {true, undefined} -> ok;
-    {false, Cert} when is_binary(Cert) -> ok;
+    {_, Cert} when is_binary(Cert) -> ok;
     _ -> erlang:error({misconfigured, certificate_root})
   end,
   case maps:get(merchant_id, Opts, undefined) of
@@ -180,7 +180,10 @@ extension_oid_predicate(OID) ->
 
 verify_apple_certificates(_, _, #{skip_chain_verification := true}) -> ok;
 verify_apple_certificates(Leaf, Intermediate, #{certificate_root := Root}) ->
-  public_key:pkix_path_validation(Root, [Intermediate, Leaf], []).
+  case public_key:pkix_path_validation(Root, [Intermediate, Leaf], []) of
+    {error, Reason} -> erlang:error({bad_signature, Reason});
+    _ -> ok
+  end.
 
 
 pkcs7_verify(Message, #'SignedData'{version = Vsn} = SD, Config) ->
